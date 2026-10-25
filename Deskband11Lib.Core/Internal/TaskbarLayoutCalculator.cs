@@ -1,8 +1,14 @@
-﻿using Windows.Win32;
+using Windows.Win32;
 using Windows.Win32.Foundation;
 
 namespace Deskband11Lib.Core.Internal;
 
+/// <summary>
+/// Fork 改动：布局计算全面轴向化。
+/// "主轴"（axis）指沿任务栏条带的方向——横排任务栏为 X 轴，竖排任务栏为 Y 轴；
+/// "厚度"（cross extent）指垂直于主轴的任务栏宽度。
+/// PreferredWidth 语义 = 沿主轴的期望长度；PreferredHeight = 厚度方向期望值。
+/// </summary>
 internal sealed class TaskbarLayoutCalculator(TaskbarWindowLocator taskbarWindowLocator, TaskbarContentHostOptions options, TaskbarButtonReader taskbarButtonReader, Func<int> getEffectiveMonitorIdentity)
 {
     private static double? s_lastScaleFactor;
@@ -10,13 +16,23 @@ internal sealed class TaskbarLayoutCalculator(TaskbarWindowLocator taskbarWindow
     public async Task RefreshTaskbarButtonMeasurementAsync()
     {
         if (!options.TrackTaskbarButtons) return;
-        if (!taskbarWindowLocator.TryRefresh(getEffectiveMonitorIdentity())) return;
-        if (!TryGetWindowRectangle(taskbarWindowLocator.TaskbarWindow, out var taskbarRectangle)) return;
+        if (!taskbarWindowLocator.TryRefresh(getEffectiveMonitorIdentity()))
+        {
+            ForkDiag.WriteVerbose("calc: refresh skipped, locator TryRefresh failed");
+            return;
+        }
+        if (!TryGetWindowRectangle(taskbarWindowLocator.TaskbarWindow, out var taskbarRectangle))
+        {
+            ForkDiag.WriteVerbose("calc: refresh skipped, no taskbar rect");
+            return;
+        }
 
+        var orientation = TaskbarOrientationDetector.Detect(taskbarRectangle);
         var rowRectangle = TryGetWindowRectangle(taskbarWindowLocator.RebarWindow, out var rebarRectangle) ? rebarRectangle : taskbarRectangle;
-        var searchLeft = taskbarRectangle.left;
-        var searchRight = ResolveNotificationLeft(taskbarRectangle);
-        if (TryGetTaskbarButtonsSearchRectangle(taskbarRectangle, rowRectangle, searchLeft, searchRight, out var taskbarButtonsSearchRectangle)) await taskbarButtonReader.RefreshAsync(taskbarWindowLocator.TaskbarWindow, taskbarButtonsSearchRectangle);
+        var notificationBoundary = ResolveNotificationBoundary(taskbarRectangle, orientation);
+        ForkDiag.WriteVerbose($"calc: orientation={orientation} taskbarRect={taskbarRectangle.left},{taskbarRectangle.top},{taskbarRectangle.right},{taskbarRectangle.bottom} notifWindowNull={taskbarWindowLocator.NotificationWindow.IsNull} notificationBoundary={notificationBoundary}");
+        if (TryGetTaskbarButtonsSearchRectangle(taskbarRectangle, rowRectangle, orientation, notificationBoundary, out var taskbarButtonsSearchRectangle)) await taskbarButtonReader.RefreshAsync(taskbarWindowLocator.TaskbarWindow, taskbarButtonsSearchRectangle, orientation);
+        else ForkDiag.WriteVerbose("calc: search rectangle invalid, no refresh");
     }
 
     public TaskbarLayoutSnapshot Calculate(double requestedWidth, double requestedHeight, double scaleFactor, TaskbarSlotInfo? ownSlot, IReadOnlyList<TaskbarSlotInfo> siblingSlots)
@@ -25,25 +41,26 @@ internal sealed class TaskbarLayoutCalculator(TaskbarWindowLocator taskbarWindow
         if (!TryGetWindowRectangle(taskbarWindowLocator.TaskbarWindow, out var taskbarRectangle)) return default;
         scaleFactor = NormalizeScaleFactor(scaleFactor);
 
+        var orientation = TaskbarOrientationDetector.Detect(taskbarRectangle);
         var rowRectangle = TryGetWindowRectangle(taskbarWindowLocator.RebarWindow, out var rebarRectangle) ? rebarRectangle : taskbarRectangle;
-        var searchLeft = taskbarRectangle.left;
-        var searchRight = ResolveNotificationLeft(taskbarRectangle);
+        var notificationBoundary = ResolveNotificationBoundary(taskbarRectangle, orientation);
 
         TaskbarButtonGeometry geometry = default;
-        if (options.TrackTaskbarButtons && TryGetTaskbarButtonsSearchRectangle(taskbarRectangle, rowRectangle, searchLeft, searchRight, out var taskbarButtonsSearchRectangle)) taskbarButtonReader.TryGetTaskbarButtonGeometry(taskbarWindowLocator.TaskbarWindow, taskbarButtonsSearchRectangle, out geometry);
+        if (options.TrackTaskbarButtons && TryGetTaskbarButtonsSearchRectangle(taskbarRectangle, rowRectangle, orientation, notificationBoundary, out var taskbarButtonsSearchRectangle)) taskbarButtonReader.TryGetTaskbarButtonGeometry(taskbarWindowLocator.TaskbarWindow, taskbarButtonsSearchRectangle, orientation, out geometry);
 
-        var alignment = TaskbarAlignmentDetector.Detect(taskbarWindowLocator.TaskbarWindow, geometry.StartButton);
-        var notificationLeft = geometry.NotificationArea.IsValid ? geometry.NotificationArea.Left : searchRight;
-        var (areaLeft, areaRight, leftAlign) = SelectContentArea(options.Placement, alignment, taskbarRectangle, notificationLeft, geometry);
+        var alignment = TaskbarAlignmentDetector.Detect(taskbarWindowLocator.TaskbarWindow, geometry.StartButton, orientation);
+        var notificationStart = geometry.NotificationArea.IsValid ? geometry.NotificationArea.Start : notificationBoundary;
+        var (areaStart, areaEnd, startAlign) = SelectContentArea(options.Placement, alignment, taskbarRectangle, orientation, notificationStart, geometry);
 
-        var availableWidth = Math.Max(0, areaRight - areaLeft);
+        var availableWidth = Math.Max(0, areaEnd - areaStart);
 
-        var resolvedPlacement = ResolveActualPlacement(options.Placement, alignment, leftAvailableWidth: Math.Max(0, ComputeLeftGap(taskbarRectangle, geometry).Right - ComputeLeftGap(taskbarRectangle, geometry).Left), rightAvailableWidth: Math.Max(0, ComputeRightGap(notificationLeft, geometry).Right - ComputeRightGap(notificationLeft, geometry).Left));
+        var resolvedPlacement = ResolveActualPlacement(options.Placement, alignment, leftAvailableWidth: Math.Max(0, ComputeStartGap(taskbarRectangle, orientation, geometry).End - ComputeStartGap(taskbarRectangle, orientation, geometry).Start), rightAvailableWidth: Math.Max(0, ComputeEndGap(notificationStart, geometry).End - ComputeEndGap(notificationStart, geometry).Start));
 
         if (availableWidth <= 0) return new TaskbarLayoutSnapshot(0, 0, 0, 0, 0, scaleFactor, false, resolvedPlacement);
 
-        var requestedHeightInPixels = Math.Max(1, (int)Math.Ceiling(requestedHeight * scaleFactor));
-        var height = Math.Min(requestedHeightInPixels, Math.Max(1, rowRectangle.bottom - rowRectangle.top));
+        var requestedThicknessInPixels = Math.Max(1, (int)Math.Ceiling(requestedHeight * scaleFactor));
+        var crossExtent = orientation == TaskbarOrientation.Horizontal ? rowRectangle.bottom - rowRectangle.top : rowRectangle.right - rowRectangle.left;
+        var thickness = Math.Min(requestedThicknessInPixels, Math.Max(1, crossExtent));
 
         var effectiveOwnSlot = ownSlot.HasValue && ownSlot.Value.ActualPlacement != resolvedPlacement ? ownSlot.Value with { ActualPlacement = resolvedPlacement } : ownSlot;
         var siblingsInSameArea = FilterSiblingsInSameArea(siblingSlots, resolvedPlacement, getEffectiveMonitorIdentity());
@@ -66,10 +83,16 @@ internal sealed class TaskbarLayoutCalculator(TaskbarWindowLocator taskbarWindow
 
         if (allocatedWidth <= 0) return new TaskbarLayoutSnapshot(0, 0, 0, 0, 0, scaleFactor, false, resolvedPlacement);
 
-        var x = (leftAlign ? areaLeft + offsetX : areaRight - offsetX - allocatedWidth) - taskbarRectangle.left;
-        var y = rowRectangle.top - taskbarRectangle.top;
+        // Fork 改动：轴向偏移 → 屏幕坐标的映射按方向分支；
+        // 交叉轴（条带厚度方向）在剩余空间内居中，避免贴边。
+        var stripAxisStart = orientation == TaskbarOrientation.Horizontal ? taskbarRectangle.left : taskbarRectangle.top;
+        var axisOffset = (startAlign ? areaStart + offsetX : areaEnd - offsetX - allocatedWidth) - stripAxisStart;
+        var crossBase = orientation == TaskbarOrientation.Horizontal ? rowRectangle.top - taskbarRectangle.top : rowRectangle.left - taskbarRectangle.left;
+        var crossOffset = crossBase + Math.Max(0, crossExtent - thickness) / 2;
 
-        return new TaskbarLayoutSnapshot(x, y, allocatedWidth, height, availableWidth, scaleFactor, true, resolvedPlacement);
+        return orientation == TaskbarOrientation.Horizontal
+            ? new TaskbarLayoutSnapshot(axisOffset, crossOffset, allocatedWidth, thickness, availableWidth, scaleFactor, true, resolvedPlacement)
+            : new TaskbarLayoutSnapshot(crossOffset, axisOffset, thickness, allocatedWidth, availableWidth, scaleFactor, true, resolvedPlacement);
     }
 
     private static TaskbarContentPlacement ResolveActualPlacement(TaskbarContentPlacement requestedPlacement, TaskbarAlignment alignment, int leftAvailableWidth, int rightAvailableWidth)
@@ -173,46 +196,54 @@ internal sealed class TaskbarLayoutCalculator(TaskbarWindowLocator taskbarWindow
         return availableWidth;
     }
 
-    private int ResolveNotificationLeft(RECT taskbarRectangle)
+    /// <summary>Fork 改动：通知区边界按轴向取值——横排用通知区 left，竖排用通知区 top。</summary>
+    private int ResolveNotificationBoundary(RECT taskbarRectangle, TaskbarOrientation orientation)
     {
-        if (options.TrackNotificationArea && TryGetWindowRectangle(taskbarWindowLocator.NotificationWindow, out var notificationRectangle)) return Math.Min(taskbarRectangle.right, notificationRectangle.left);
-        return taskbarRectangle.right;
+        if (options.TrackNotificationArea && TryGetWindowRectangle(taskbarWindowLocator.NotificationWindow, out var notificationRectangle))
+        {
+            return orientation == TaskbarOrientation.Horizontal
+                ? Math.Min(taskbarRectangle.right, notificationRectangle.left)
+                : Math.Min(taskbarRectangle.bottom, notificationRectangle.top);
+        }
+
+        return orientation == TaskbarOrientation.Horizontal ? taskbarRectangle.right : taskbarRectangle.bottom;
     }
 
-    private static (int AreaLeft, int AreaRight, bool LeftAlign) SelectContentArea(TaskbarContentPlacement placement, TaskbarAlignment alignment, RECT taskbarRectangle, int notificationLeft, TaskbarButtonGeometry geometry)
+    private static (int AreaStart, int AreaEnd, bool StartAlign) SelectContentArea(TaskbarContentPlacement placement, TaskbarAlignment alignment, RECT taskbarRectangle, TaskbarOrientation orientation, int notificationStart, TaskbarButtonGeometry geometry)
     {
-        var leftGap = ComputeLeftGap(taskbarRectangle, geometry);
-        var rightGap = ComputeRightGap(notificationLeft, geometry);
-        var leftAvailableWidth = Math.Max(0, leftGap.Right - leftGap.Left);
-        var rightAvailableWidth = Math.Max(0, rightGap.Right - rightGap.Left);
+        var startGap = ComputeStartGap(taskbarRectangle, orientation, geometry);
+        var endGap = ComputeEndGap(notificationStart, geometry);
+        var startAvailableWidth = Math.Max(0, startGap.End - startGap.Start);
+        var endAvailableWidth = Math.Max(0, endGap.End - endGap.Start);
 
-        var useLeftGap = placement switch
+        var useStartGap = placement switch
         {
             TaskbarContentPlacement.LeftEdge => alignment == TaskbarAlignment.Center,
             TaskbarContentPlacement.BeforeStartButton => alignment == TaskbarAlignment.Center,
-            TaskbarContentPlacement.Auto => alignment == TaskbarAlignment.Center && leftAvailableWidth > rightAvailableWidth,
+            TaskbarContentPlacement.Auto => alignment == TaskbarAlignment.Center && startAvailableWidth > endAvailableWidth,
             _ => false
         };
 
-        if (!useLeftGap) return (rightGap.Left, rightGap.Right, false);
+        if (!useStartGap) return (endGap.Start, endGap.End, false);
 
-        var leftAlign = placement is TaskbarContentPlacement.LeftEdge or TaskbarContentPlacement.Auto;
-        return (leftGap.Left, leftGap.Right, leftAlign);
+        var startAlign = placement is TaskbarContentPlacement.LeftEdge or TaskbarContentPlacement.Auto;
+        return (startGap.Start, startGap.End, startAlign);
     }
 
-    private static (int Left, int Right) ComputeLeftGap(RECT taskbarRectangle, TaskbarButtonGeometry geometry)
+    private static (int Start, int End) ComputeStartGap(RECT taskbarRectangle, TaskbarOrientation orientation, TaskbarButtonGeometry geometry)
     {
-        var left = geometry.WidgetsButton.IsValid ? geometry.WidgetsButton.Right : taskbarRectangle.left;
-        var right = geometry.StartButton.IsValid ? geometry.StartButton.Left : taskbarRectangle.left;
-        return (left, right);
+        var stripAxisStart = orientation == TaskbarOrientation.Horizontal ? taskbarRectangle.left : taskbarRectangle.top;
+        var start = geometry.WidgetsButton.IsValid ? geometry.WidgetsButton.End : stripAxisStart;
+        var end = geometry.StartButton.IsValid ? geometry.StartButton.Start : stripAxisStart;
+        return (start, end);
     }
 
-    private static (int Left, int Right) ComputeRightGap(int notificationLeft, TaskbarButtonGeometry geometry)
+    private static (int Start, int End) ComputeEndGap(int notificationStart, TaskbarButtonGeometry geometry)
     {
-        var left = geometry.TaskbarButtonsGroup.IsValid ? geometry.TaskbarButtonsGroup.Right : (geometry.StartButton.IsValid ? geometry.StartButton.Right : notificationLeft);
-        var right = notificationLeft;
-        if (geometry.WidgetsButton.IsValid && geometry.WidgetsButton.Left >= left && geometry.WidgetsButton.Left < right) right = geometry.WidgetsButton.Left;
-        return (left, right);
+        var start = geometry.TaskbarButtonsGroup.IsValid ? geometry.TaskbarButtonsGroup.End : (geometry.StartButton.IsValid ? geometry.StartButton.End : notificationStart);
+        var end = notificationStart;
+        if (geometry.WidgetsButton.IsValid && geometry.WidgetsButton.Start >= start && geometry.WidgetsButton.Start < end) end = geometry.WidgetsButton.Start;
+        return (start, end);
     }
 
     private static double NormalizeScaleFactor(double scaleFactor)
@@ -229,15 +260,24 @@ internal sealed class TaskbarLayoutCalculator(TaskbarWindowLocator taskbarWindow
         return !window.IsNull && PInvoke.GetWindowRect(window, out rectangle);
     }
 
-    private static bool TryGetTaskbarButtonsSearchRectangle(RECT taskbarRectangle, RECT rowRectangle, int leftBoundary, int rightBoundary, out RECT rectangle)
+    /// <summary>Fork 改动：按钮搜索带按方向构造——主轴方向用任务栏起止（含开始按钮），交叉方向用 ReBar 钳制。</summary>
+    private static bool TryGetTaskbarButtonsSearchRectangle(RECT taskbarRectangle, RECT rowRectangle, TaskbarOrientation orientation, int axisEndBoundary, out RECT rectangle)
     {
-        rectangle = new RECT
-        {
-            left = leftBoundary,
-            top = Math.Max(taskbarRectangle.top, rowRectangle.top),
-            right = rightBoundary,
-            bottom = Math.Min(taskbarRectangle.bottom, rowRectangle.bottom)
-        };
+        rectangle = orientation == TaskbarOrientation.Horizontal
+            ? new RECT
+            {
+                left = taskbarRectangle.left,
+                top = Math.Max(taskbarRectangle.top, rowRectangle.top),
+                right = axisEndBoundary,
+                bottom = Math.Min(taskbarRectangle.bottom, rowRectangle.bottom)
+            }
+            : new RECT
+            {
+                left = Math.Max(taskbarRectangle.left, rowRectangle.left),
+                top = taskbarRectangle.top,
+                right = Math.Min(taskbarRectangle.right, rowRectangle.right),
+                bottom = Math.Min(taskbarRectangle.bottom, axisEndBoundary)
+            };
 
         return rectangle.right > rectangle.left && rectangle.bottom > rectangle.top;
     }

@@ -10,12 +10,12 @@ internal static class TaskbarAlignmentDetector
     private const string TaskbarAlignmentValueName = "TaskbarAl";
     private const double LeftAlignmentThresholdRatio = 0.15;
 
-    public static TaskbarAlignment Detect(HWND taskbarWindow, ButtonSpan startButtonSpan)
+    public static TaskbarAlignment Detect(HWND taskbarWindow, ButtonSpan startButtonSpan, TaskbarOrientation orientation)
     {
         var registryAlignment = ReadRegistryAlignment();
         if (registryAlignment != TaskbarAlignment.Unknown) return registryAlignment;
 
-        return InferAlignmentFromPosition(taskbarWindow, startButtonSpan);
+        return InferAlignmentFromPosition(taskbarWindow, startButtonSpan, orientation);
     }
 
     public static TaskbarAlignment ReadRegistryAlignment()
@@ -35,14 +35,16 @@ internal static class TaskbarAlignmentDetector
         return TaskbarAlignment.Unknown;
     }
 
-    private static TaskbarAlignment InferAlignmentFromPosition(HWND taskbarWindow, ButtonSpan startButtonSpan)
+    /// <summary>Fork 改动：按主轴推断对齐（竖排任务栏的 Left = 顶端对齐）。</summary>
+    private static TaskbarAlignment InferAlignmentFromPosition(HWND taskbarWindow, ButtonSpan startButtonSpan, TaskbarOrientation orientation)
     {
         if (!startButtonSpan.IsValid || taskbarWindow.IsNull) return TaskbarAlignment.Unknown;
         if (!PInvoke.GetWindowRect(taskbarWindow, out var taskbarRectangle)) return TaskbarAlignment.Unknown;
 
-        var taskbarWidth = taskbarRectangle.right - taskbarRectangle.left;
-        if (taskbarWidth <= 0) return TaskbarAlignment.Unknown;
+        var stripAxisLength = orientation == TaskbarOrientation.Horizontal ? taskbarRectangle.right - taskbarRectangle.left : taskbarRectangle.bottom - taskbarRectangle.top;
+        if (stripAxisLength <= 0) return TaskbarAlignment.Unknown;
 
-        return startButtonSpan.Left - taskbarRectangle.left < taskbarWidth * LeftAlignmentThresholdRatio ? TaskbarAlignment.Left : TaskbarAlignment.Center;
+        var stripAxisStart = orientation == TaskbarOrientation.Horizontal ? taskbarRectangle.left : taskbarRectangle.top;
+        return startButtonSpan.Start - stripAxisStart < stripAxisLength * LeftAlignmentThresholdRatio ? TaskbarAlignment.Left : TaskbarAlignment.Center;
     }
 }

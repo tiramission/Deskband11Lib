@@ -24,12 +24,12 @@ internal sealed partial class TaskbarButtonReader : IDisposable
     private bool _isRefreshRunning;
     private bool _isDisposed;
 
-    public bool TryGetTaskbarButtonGeometry(HWND taskbarWindow, RECT searchRectangle, out TaskbarButtonGeometry geometry)
+    public bool TryGetTaskbarButtonGeometry(HWND taskbarWindow, RECT searchRectangle, TaskbarOrientation orientation, out TaskbarButtonGeometry geometry)
     {
         geometry = default;
         if (taskbarWindow.IsNull) return false;
 
-        QueueRefresh(taskbarWindow, searchRectangle);
+        QueueRefresh(taskbarWindow, searchRectangle, orientation);
 
         lock (_refreshLock)
         {
@@ -48,11 +48,16 @@ internal sealed partial class TaskbarButtonReader : IDisposable
         }
     }
 
-    public Task RefreshAsync(HWND taskbarWindow, RECT searchRectangle)
+    public Task RefreshAsync(HWND taskbarWindow, RECT searchRectangle, TaskbarOrientation orientation)
     {
-        if (!TryBeginRefresh()) return Task.CompletedTask;
+        if (!TryBeginRefresh())
+        {
+            ForkDiag.Write("reader: RefreshAsync skipped, refresh already running or disposed");
+            return Task.CompletedTask;
+        }
 
-        return Task.Run(() => RefreshCachedGeometry(taskbarWindow, searchRectangle));
+        ForkDiag.WriteVerbose($"reader: RefreshAsync scheduling UIA read, orientation={orientation}");
+        return Task.Run(() => RefreshCachedGeometry(taskbarWindow, searchRectangle, orientation));
     }
 
     public void Dispose()
@@ -65,11 +70,11 @@ internal sealed partial class TaskbarButtonReader : IDisposable
         }
     }
 
-    private void QueueRefresh(HWND taskbarWindow, RECT searchRectangle)
+    private void QueueRefresh(HWND taskbarWindow, RECT searchRectangle, TaskbarOrientation orientation)
     {
         if (!TryBeginRefresh()) return;
 
-        ThreadPool.QueueUserWorkItem(_ => RefreshCachedGeometry(taskbarWindow, searchRectangle));
+        ThreadPool.QueueUserWorkItem(_ => RefreshCachedGeometry(taskbarWindow, searchRectangle, orientation));
     }
 
     private bool TryBeginRefresh()
@@ -83,12 +88,14 @@ internal sealed partial class TaskbarButtonReader : IDisposable
         }
     }
 
-    private void RefreshCachedGeometry(HWND taskbarWindow, RECT searchRectangle)
+    private void RefreshCachedGeometry(HWND taskbarWindow, RECT searchRectangle, TaskbarOrientation orientation)
     {
+        ForkDiag.WriteVerbose("reader: RefreshCachedGeometry entered");
         try
         {
-            if (TryReadTaskbarGeometry(taskbarWindow, searchRectangle, out var geometry))
+            if (TryReadTaskbarGeometry(taskbarWindow, searchRectangle, orientation, out var geometry))
             {
+                ForkDiag.WriteVerbose($"reader: geometry OK start={geometry.StartButton} widgets={geometry.WidgetsButton} group={geometry.TaskbarButtonsGroup} notif={geometry.NotificationArea}");
                 lock (_refreshLock)
                 {
                     if (_isDisposed) return;
@@ -97,8 +104,15 @@ internal sealed partial class TaskbarButtonReader : IDisposable
                     _hasCachedGeometry = true;
                 }
             }
+            else
+            {
+                ForkDiag.Write("reader: measurement returned false");
+            }
         }
-        catch (Exception) { }
+        catch (Exception ex)
+        {
+            ForkDiag.Write($"reader: RefreshCachedGeometry swallowed {ex.GetType().Name}: {ex.Message}");
+        }
         finally
         {
             lock (_refreshLock)
@@ -109,9 +123,10 @@ internal sealed partial class TaskbarButtonReader : IDisposable
     }
 
     [UnconditionalSuppressMessage("AOT", "IL2050", Justification = "UI Automation is an optional geometry probe. Failures keep the previous cached measurement.")]
-    private static unsafe bool TryReadTaskbarGeometry(HWND taskbarWindow, RECT searchRectangle, out TaskbarButtonGeometry geometry)
+    private static unsafe bool TryReadTaskbarGeometry(HWND taskbarWindow, RECT searchRectangle, TaskbarOrientation orientation, out TaskbarButtonGeometry geometry)
     {
         geometry = default;
+        ForkDiag.WriteVerbose($"reader: TryReadTaskbarGeometry entered, orientation={orientation}");
         if (!TryGetWindowProcessIdentifier(taskbarWindow, out var taskbarProcessIdentifier)) return false;
 
         IGeneratedUIAutomation? automation = null;
@@ -121,11 +136,15 @@ internal sealed partial class TaskbarButtonReader : IDisposable
         List<GeneratedRectangle> taskbarAppButtonRectangles = [];
         var startButtonSpan = ButtonSpan.Invalid;
         var widgetsButtonSpan = ButtonSpan.Invalid;
-        var notificationAreaLeft = int.MaxValue;
-        var notificationAreaRight = int.MinValue;
+        var notificationAreaStart = int.MaxValue;
+        var notificationAreaEnd = int.MinValue;
         var coInitializeResult = CoInitializeEx(0, CoInitializeMultithreaded);
         var shouldUninitializeCom = coInitializeResult is 0 or 1;
-        if (coInitializeResult < 0 && coInitializeResult != RpcChangedMode) return false;
+        if (coInitializeResult < 0 && coInitializeResult != RpcChangedMode)
+        {
+            ForkDiag.Write($"reader: CoInitializeEx failed hr=0x{coInitializeResult:X8}");
+            return false;
+        }
 
         try
         {
@@ -137,6 +156,10 @@ internal sealed partial class TaskbarButtonReader : IDisposable
             taskbarElement = automation.ElementFromHandle(taskbarWindow);
             taskButtonElements = taskbarElement.FindAll(GeneratedTreeScope.Descendants, trueCondition);
             var count = taskButtonElements.GetLength();
+            ForkDiag.WriteVerbose($"reader: UIA ok, {count} descendant elements under taskbar 0x{(long)taskbarWindow.Value:X}, searchRect={searchRectangle.left},{searchRectangle.top},{searchRectangle.right},{searchRectangle.bottom}");
+
+            var visibleButtonCount = 0;
+            var identifierSeen = new HashSet<string>();
 
             for (var index = 0; index < count; index++)
             {
@@ -146,14 +169,25 @@ internal sealed partial class TaskbarButtonReader : IDisposable
                     var automationIdentifier = TryGetAutomationIdentifier(taskButtonElement);
                     var isNotificationAreaElement = automationIdentifier == SystemTrayIconAutomationIdentifier || automationIdentifier == NotifyItemIconAutomationIdentifier;
 
+                    if (!string.IsNullOrEmpty(automationIdentifier) && identifierSeen.Add(automationIdentifier) && identifierSeen.Count <= 24)
+                    {
+                        ForkDiag.WriteVerbose($"reader: identifier '{automationIdentifier}' rect={TryDescribeRect(taskButtonElement)}");
+                    }
+
                     if (!isNotificationAreaElement && !IsVisibleTaskbarButton(taskButtonElement, taskbarProcessIdentifier)) continue;
                     if (!TryGetBoundingRectangle(taskButtonElement, out var boundingRectangle)) continue;
+                    if (automationIdentifier == StartButtonAutomationIdentifier)
+                    {
+                        ForkDiag.WriteVerbose($"reader: StartButton passed filters, rect L={boundingRectangle.Left} T={boundingRectangle.Top} R={boundingRectangle.Right} B={boundingRectangle.Bottom}");
+                    }
+
+                    visibleButtonCount++;
 
                     if (isNotificationAreaElement)
                     {
                         if (!IsInsideSearchRectangle(searchRectangle, boundingRectangle)) continue;
-                        notificationAreaLeft = Math.Min(notificationAreaLeft, boundingRectangle.Left);
-                        notificationAreaRight = Math.Max(notificationAreaRight, boundingRectangle.Right);
+                        notificationAreaStart = Math.Min(notificationAreaStart, GetAxisStart(boundingRectangle, orientation));
+                        notificationAreaEnd = Math.Max(notificationAreaEnd, GetAxisEnd(boundingRectangle, orientation));
                         continue;
                     }
 
@@ -161,12 +195,12 @@ internal sealed partial class TaskbarButtonReader : IDisposable
 
                     if (automationIdentifier == StartButtonAutomationIdentifier)
                     {
-                        startButtonSpan = new ButtonSpan(boundingRectangle.Left, boundingRectangle.Right);
+                        startButtonSpan = ToAxisSpan(boundingRectangle, orientation);
                         continue;
                     }
                     if (automationIdentifier == WidgetsButtonAutomationIdentifier)
                     {
-                        widgetsButtonSpan = new ButtonSpan(boundingRectangle.Left, boundingRectangle.Right);
+                        widgetsButtonSpan = ToAxisSpan(boundingRectangle, orientation);
                         continue;
                     }
 
@@ -175,12 +209,17 @@ internal sealed partial class TaskbarButtonReader : IDisposable
                 finally { ReleaseComObject(taskButtonElement); }
             }
 
-            var taskbarButtonsGroup = ResolveTaskbarButtonsGroup(startButtonSpan, taskbarAppButtonRectangles);
-            var notificationAreaSpan = notificationAreaLeft <= notificationAreaRight ? new ButtonSpan(notificationAreaLeft, notificationAreaRight) : ButtonSpan.Invalid;
+            var taskbarButtonsGroup = ResolveTaskbarButtonsGroup(startButtonSpan, taskbarAppButtonRectangles, orientation);
+            var notificationAreaSpan = notificationAreaStart <= notificationAreaEnd ? new ButtonSpan(notificationAreaStart, notificationAreaEnd) : ButtonSpan.Invalid;
             geometry = new TaskbarButtonGeometry(startButtonSpan, widgetsButtonSpan, taskbarButtonsGroup, notificationAreaSpan);
+            ForkDiag.WriteVerbose($"reader: loop done, visibleButtons={visibleButtonCount}, appButtonRects={taskbarAppButtonRectangles.Count}, start={startButtonSpan}, group={taskbarButtonsGroup}, notif={notificationAreaSpan}");
             return startButtonSpan.IsValid || widgetsButtonSpan.IsValid || taskbarButtonsGroup.IsValid || notificationAreaSpan.IsValid;
         }
-        catch (COMException) { return false; }
+        catch (COMException ex)
+        {
+            ForkDiag.Write($"reader: COMException hr=0x{ex.HResult:X8}: {ex.Message}");
+            return false;
+        }
         finally
         {
             ReleaseComObject(taskButtonElements);
@@ -202,24 +241,45 @@ internal sealed partial class TaskbarButtonReader : IDisposable
         catch { return string.Empty; }
     }
 
-    private static ButtonSpan ResolveTaskbarButtonsGroup(ButtonSpan startButtonSpan, List<GeneratedRectangle> taskbarAppButtonRectangles)
+    private static string TryDescribeRect(IGeneratedUIAutomationElement element)
+    {
+        try
+        {
+            return element.GetCurrentBoundingRectangle(out var rectangle) < 0 ? "(hr<0)" : $"({rectangle.Left},{rectangle.Top},{rectangle.Right},{rectangle.Bottom})";
+        }
+        catch { return "(?)"; }
+    }
+
+    /// <summary>Fork 改动：按钮组解析按任务栏主轴排序与聚簇。</summary>
+    private static ButtonSpan ResolveTaskbarButtonsGroup(ButtonSpan startButtonSpan, List<GeneratedRectangle> taskbarAppButtonRectangles, TaskbarOrientation orientation)
     {
         if (taskbarAppButtonRectangles.Count == 0) return ButtonSpan.Invalid;
 
-        var anchor = startButtonSpan.IsValid ? startButtonSpan.Right : 0;
-        var rightEdge = anchor;
-        var leftEdge = int.MaxValue;
+        var anchor = startButtonSpan.IsValid ? startButtonSpan.End : 0;
+        var groupEnd = anchor;
+        var groupStart = int.MaxValue;
 
-        foreach (var rectangle in taskbarAppButtonRectangles.OrderBy(rectangle => rectangle.Left))
+        foreach (var rectangle in taskbarAppButtonRectangles.OrderBy(rectangle => GetAxisStart(rectangle, orientation)))
         {
-            if (rectangle.Left > rightEdge + MaximumTaskbarButtonGap) break;
+            if (GetAxisStart(rectangle, orientation) > groupEnd + MaximumTaskbarButtonGap) break;
 
-            leftEdge = Math.Min(leftEdge, rectangle.Left);
-            rightEdge = Math.Max(rightEdge, rectangle.Right);
+            groupStart = Math.Min(groupStart, GetAxisStart(rectangle, orientation));
+            groupEnd = Math.Max(groupEnd, GetAxisEnd(rectangle, orientation));
         }
 
-        return rightEdge > anchor ? new ButtonSpan(leftEdge, rightEdge) : ButtonSpan.Invalid;
+        return groupEnd > anchor ? new ButtonSpan(groupStart, groupEnd) : ButtonSpan.Invalid;
     }
+
+    private static ButtonSpan ToAxisSpan(GeneratedRectangle rectangle, TaskbarOrientation orientation) =>
+        orientation == TaskbarOrientation.Horizontal
+            ? new ButtonSpan(rectangle.Left, rectangle.Right)
+            : new ButtonSpan(rectangle.Top, rectangle.Bottom);
+
+    private static int GetAxisStart(GeneratedRectangle rectangle, TaskbarOrientation orientation) =>
+        orientation == TaskbarOrientation.Horizontal ? rectangle.Left : rectangle.Top;
+
+    private static int GetAxisEnd(GeneratedRectangle rectangle, TaskbarOrientation orientation) =>
+        orientation == TaskbarOrientation.Horizontal ? rectangle.Right : rectangle.Bottom;
 
     private static bool IsVisibleTaskbarButton(IGeneratedUIAutomationElement element, int taskbarProcessIdentifier)
     {
